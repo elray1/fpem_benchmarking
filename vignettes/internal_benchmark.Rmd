@@ -1,0 +1,397 @@
+---
+title: "internal_benchmark"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{internal_benchmark}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(tidyverse)
+library(mvtnorm)
+library(cmdstanr)
+#library(fpemBenchmark)
+```
+
+
+# Data generating model
+
+In a simplified version of our problem, at each time point $t = 1, \ldots, T$ we observe an $L+1$-dimensional column vector $y_t = (y_{t, 0}, y_{t,1}, \ldots, y_{t,L})^\top$ that collects estimates of prevalence at the national level, $y_{t,0}$, and in each of $L$ subnational units. In practice, the underlying prevalence in each location will be time varying, but here we fix these to be constant over time, denoted by $\eta = (\eta_0, \eta_1, \ldots, \eta_{L})^\top$. By definition, the national level prevalence is a population-weighted mean of prevalence in subnational units: $\eta_0 = \sum_{u=1}^L p_u \eta_u$, where $p_u$ is the proportion of the national population that resides in subnational unit $u$ (for now, assumed known and fixed over time). We assume that this aggregation constraint also holds for the observed estimates of prevalence, so that for each $t$, $y_{t,0} = \sum_{u=1}^L p_u y_{t,u}$.  We can express this by writing $\mathbf{y}_t = P \mathbf{y}_{t, 1:L}$ and $\eta = P \eta_{1:L}$, where
+$$P = \begin{bmatrix} p_{1} & \cdots & p_{L} \\
+                        1       & \cdots & 0         \\
+                        \vdots  & \ddots & \vdots    \\
+                        0       & \cdots & 1           \end{bmatrix}.$$
+
+Along with the estimates of prevalence, we also observe standard errors that measure the estimated variability of entries of $y_t$ around their corresponding means $\eta$. We assume that the observations in subnational units are conditionally independent given $\eta$, with standard errors $s_1, \ldots, s_{L}$ that are constant over time. We also assume that uncertainty at the national level is consistent with the aggregation constraint, so that $s_{0} = \left[ Var(Y_{t,0}) \right]^{1/2} = \left[\sum_{u=1}^L p_u^2 s_{u}^2\right]^{1/2}$, with covariance between the national level estimate and each subnational estimate given by $p_u s_u^2$. We emphasize that we assume throughout this document that the standard errors are correct and that there are no non-sampling errors associated with the survey estimates.
+
+Putting the above together with an assumption of normality, the full vector $Y_t$ follows a singular multivariate normal distribution:
+\begin{align*}
+Y_{t} \mid \eta, s &\sim MVN(P \eta_{1:L}, P \text{diag}(s_1^2, \ldots, s_L^2) P^\top),
+\end{align*}
+where the $(L+1)$ by $(L+1)$ covariance matrix $P \text{diag}(s_1^2, \ldots, s_L^2) P^\top$ is non-negative definite with rank $L$. This distribution does not have a density, but all sub-vectors of length $L$ (e.g. consisting of all sub-national units or the national level observation and all but one of the sub-national units) follow a multivariate normal distribution with a density.
+
+We adopt a simplified hierarchical process model that is specified only in terms of the subnational latent prevalence levels $\eta_1, \ldots, \eta_L$, with the national level prevalence $\eta_0$ defined implicitly through the aggregation constraint:
+\begin{align*}
+\text{logit}(\theta) &\sim N(0, 0.1) \\
+\text{logit}(\eta_u) \mid \theta &\sim N(\text{logit}(\theta), 1)
+\end{align*}
+
+For the purpose of the simulation, we work with settings designed to match those in Kenya. Specifically, we take the population proportions matching the population levels in Kenya and the standard errors from the 2014 DHS survey:
+
+```{r}
+kenya_dat <- readr::read_csv("../data-raw/Track20 FPET Data/Kenya County Pop DHS Dist.csv") %>%
+    dplyr::filter(is_in_union == "Y") %>%
+    dplyr::group_by(mid_year) %>%
+    dplyr::mutate(pop_prop = population_count / sum(population_count)) %>%
+    dplyr::ungroup() %>%
+    dplyr::slice_max(mid_year) %>%
+    dplyr::select(region_code, pop_prop) %>%
+    dplyr::arrange(desc(pop_prop))
+
+dhs_2014_dat <- read_csv("../data-raw/Track20 FPET Data/Kenya County Surveys SEs 020623.csv") %>%
+    dplyr::filter(is_in_union == "Y", data_series_type == "DHS") %>%
+    dplyr::mutate(
+        year = floor((start_date + end_date) / 2),
+        se_modern = ifelse(is.na(se_modern), 0.01, se_modern),
+        se_modern = ifelse(se_modern <= 0, 0.01, se_modern)
+    ) %>%
+    dplyr::filter(year == 2014) %>%
+    dplyr::select(region_code, contraceptive_use_modern, se_modern)
+
+kenya_dat <- kenya_dat %>%
+    dplyr::left_join(dhs_2014_dat, by = "region_code")
+
+as.data.frame(kenya_dat)
+```
+
+We verify that data generated from this model are roughly comparable with the real data:
+
+```{r}
+sim_data <- function(T = 1) {
+    L <- 47
+    logit_theta <- rnorm(1, mean = 0, sd = 0.1)
+    logit_eta <- rnorm(L, mean = logit_theta, sd = 1)
+    eta <- exp(logit_eta) / (1 + exp(logit_eta))
+
+    y <- rmvnorm(T, mean = eta, sigma = diag(kenya_dat$se_modern^2))
+
+    # add national level values
+    eta <- c(weighted.mean(eta, kenya_dat$pop_prop), eta)
+    y <- cbind(apply(y, 1, weighted.mean, w=kenya_dat$pop_prop), y)
+
+    return(list(eta = eta, y = t(y)))
+}
+
+summary(kenya_dat$contraceptive_use_modern)
+
+set.seed(42)
+for (i in 1:10) {
+    y <- sim_data()$y
+    print(summary(y[,1]))
+}
+```
+
+# Data fitting models
+
+Our central question is how to conduct inference about the latent prevalence $\eta$ for all units (subnational and national) in a way that respects the aggregation constraint. A challenge is that the data generating distribution involves a singular multivariate normal distribution, encoding perfect dependence among the subnational and national observations.
+
+We compare four modeling options with a simulation study. Throughout, we explicitly include all location indices to clarify differences in locations considered by each model.  The models closely correspond to the data generating model above, but they introduce a parameter $\sigma_\eta$ that describes the scale of variability of the unit-specific means $\eta_u$ around the grand mean $\theta$ on the logit scale. The data generating process takes $\sigma_\eta = 1$.
+
+1. **NoAgg**: This model includes hierarchical structure similar to the FPEM plus model, but it treats all units as independent and does not directly address the aggregation constraint. We therefore expect that estimates from this model will not satisfy the aggregation constraint.
+\begin{align*}
+Y_{t, 0:L} \mid \eta, s &\sim MVN(\eta_{0:L}, \text{diag}(s_0^2, \ldots, s_L^2)) \\
+\text{logit}(\eta_u) \mid \theta, \sigma_\eta &\sim N(\text{logit}(\theta), \sigma_\eta) \\
+\text{logit}(\theta) &\sim N(0, 0.1) \\
+\sigma_\eta &\sim Exp(1)
+\end{align*}
+Maybe consider another model that projects outputs from this model into the subspace where the aggregation constraint is satisfied. We might expect that such an approach would have too-narrow prediction intervals from re-using the survey data?
+
+2. **BottomUp**: This model includes parameters $\eta_{1:L}$ for the subnational units, and estimates national level prevalence indirectly as the weighted mean of subnational prevalence.
+\begin{align*}
+Y_{t, 1:L} \mid \eta, s &\sim MVN(\eta_{1:L}, \text{diag}(s_1^2, \ldots, s_L^2)) \\
+\text{logit}(\eta_u) \mid \theta, \sigma_\eta &\sim N(\text{logit}(\theta), \sigma_\eta), \, u = 1, \ldots, L \\
+\text{logit}(\theta) &\sim N(0, 0.1) \\
+\sigma_\eta &\sim Exp(1)
+\end{align*}
+After fitting the model, we have a posterior for $\eta_{1:L}$, from which we can obtain a posterior for $\eta_0$ via $\eta_0 = \sum_{u=1}^L p_u \eta_u$.
+
+3. **DropSmallest**: This model includes parameters $\eta_{0:(L-1)}$ for the national level and all subnational units other than the one with the smallest population (which we take to correspond to index $L$). It uses a multivariate normal distribution for the observation process, with observations for all units other than $L$. The covariance matrix for this is the top left $L \times L$ submatrix of the covariance for the full $Y_t$ vector, which is full-rank. Prevalence for the smallest subnational unit can be inferred indirectly from the aggregation constraint.
+\begin{align*}
+Y_{t, 0:(L-1)} \mid \eta, s &\sim MVN(\eta_{0:(L-1)}, (P\text{diag}(s_1^2, \ldots, s_{L}^2)P^\top)_{[0:(L-1), 0:(L-1)]}) \\
+\text{logit}(\eta_u) \mid \theta, \sigma_\eta &\sim N(\text{logit}(\theta), \sigma_\eta), \, u = 0, \ldots, L-1 \\
+\text{logit}(\theta) &\sim N(0, 0.1) \\
+\sigma_\eta &\sim Exp(1)
+\end{align*}
+After fitting the model, we have a posterior for $\eta_{0:(L-1)}$, from which we can obtain a posterior for $\eta_L$ via $\eta_L = \frac{1}{p_L}(\eta_0 - \sum_{u=1}^{L-1} p_u \eta_u)$.
+
+4. **GeomMean**: This model includes all parameters $\eta_{0:L}$, and constructs something that plays the role of a likelihood as a geometric mean of leave-one-unit out likelihoods.
+\begin{align*}
+f_Y(y_{t, 0:L} \mid \eta, s) &= \prod_{i = 0, ..., L} \left[ f_{Y^{(-i)}}(y^{(-i)}_{t, 0:L} \mid \eta, s) \right]^{1/(L+1)} \\
+\text{logit}(\eta_u) \mid \theta, \sigma_\eta &\sim N(\text{logit}(\theta), \sigma_eta) \\
+\text{logit}(\theta) &\sim N(0, 0.1) \\
+\sigma_\eta &\sim Exp(1)
+\end{align*}
+Here, $f_{Y^{(-i)}}(y^{(-i)}_{t, 0:L} \mid \eta, s)$ is the density for the vector $y_{t,0:L}$ dropping unit $i$. As in the **BottomUp** and **DropSmallest** models, this corresponds to an $L$-dimensional multivariate normal distribution where the covariance matrix drops row and column $i$ of the full covariance $P\text{diag}(s_1^2, \ldots, s_{L}^2)P^\top$.
+
+5. **TopDown**: Actually we don't fit this model, but this is the idea to estimate top level prevalence and subnational proportions that Leontine suggested.  I think it's worth keeping this on our list of options.
+
+# Simulation study
+
+So far, only the **NoAgg** and **BottomUp** methods are implemented.
+
+```{r, eval = TRUE}
+no_agg_stan_code <- "
+data {
+    // Number of observations
+    int<lower=0> T;
+    
+    // Number of locations
+    int<lower=0> L;
+    
+    // Survey-based prevalence estimates
+    matrix[L, T] y;
+    
+    // Standard errors of survey-based prevalence estimates
+    vector<lower=0>[L] s;
+}
+
+parameters {
+    // overall mean, on logit scale
+    real logit_theta;
+    
+    // noise for non-centered paramerization of location means
+    vector[L] logit_eta_raw;
+    
+    // standard deviation of variability of eta around theta, on logit scale
+    real<lower=0> sigma_eta;
+}
+
+transformed parameters {
+    // vector of location means
+    vector<lower=0, upper=1>[L] eta;
+    eta = inv_logit(logit_theta + sigma_eta * logit_eta_raw);
+}
+
+model {
+    logit_theta ~ normal(0.0, 0.1);
+    logit_eta_raw ~ normal(0.0, 1.0);
+    sigma_eta ~ exponential(1.0);
+    for (t in 1:T) {
+        y[:, t] ~ normal(eta, s);
+    }
+}
+"
+```
+
+```{r, eval = TRUE, results='hide'}
+no_agg_model <- cmdstan_model(write_stan_file(no_agg_stan_code))
+```
+
+```{r, eval = TRUE, cache = TRUE}
+n_sim <- 1000
+post_qs <- purrr::map_dfr(
+    1:n_sim,
+    function(i) {
+        eta_y <- sim_data(T = 1)
+
+        data_list_no_agg_incl_nat <- list(
+            T = 1, L = 48, rel_pop = kenya_dat$pop_prop, y = eta_y$y,
+            s = c(sqrt(sum(kenya_dat$pop_prop * kenya_dat$se_modern^2)),
+                  kenya_dat$se_modern))
+
+        junk <- capture.output(fit <- no_agg_model$sample(
+            data = data_list_no_agg_incl_nat,
+            seed = 123,
+            chains = 4,
+            parallel_chains = 4,
+            refresh = 0))
+
+        post_qs_no_agg_incl_nat <- fit$draws(variables = "eta") %>%
+            tidybayes::spread_draws(eta[u]) %>%
+            dplyr::mutate(u = u - 1) %>%
+            dplyr::summarize(
+                p = list(seq(from = 0.05, to = 0.95, by = 0.05)),
+                q = list(quantile(eta, seq(from = 0.05, to = 0.95, by = 0.05)))
+            ) %>%
+            tidyr::unnest(cols = c(p, q)) %>%
+            dplyr::mutate(replicate = i, model = "no_agg") %>%
+            dplyr::left_join(
+                data.frame(
+                    u = 0:47,
+                    eta = eta_y$eta
+                ),
+                by = "u"
+            )
+        
+        data_list_bottom_up <- list(
+            T = 1, L = 47, y = eta_y$y[2:48, , drop = FALSE],
+            s = kenya_dat$se_modern)
+
+        junk <- capture.output(fit <- no_agg_model$sample(
+            data = data_list_bottom_up,
+            seed = 123,
+            chains = 4,
+            parallel_chains = 4,
+            refresh = 0))
+
+        post_qs_bottom_up <- fit$draws(variables = "eta") %>%
+            tidybayes::spread_draws(eta[u])
+        post_qs_bottom_up <- post_qs_bottom_up %>%
+            dplyr::bind_rows(
+                post_qs_bottom_up %>%
+                    dplyr::ungroup() %>%
+                    dplyr::left_join(
+                        kenya_dat %>%
+                            dplyr::mutate(u = row_number()) %>%
+                            dplyr::select(u, pop_prop),
+                        by = "u"
+                    ) %>%
+                    dplyr::group_by(.chain, .iteration, .draw) %>%
+                    dplyr::summarize(
+                        eta = weighted.mean(eta, w = pop_prop),
+                        .groups = "drop"
+                    ) %>%
+                    dplyr::mutate(u = 0)
+            ) %>%
+            dplyr::group_by(u) %>%
+            dplyr::summarize(
+                p = list(seq(from = 0.05, to = 0.95, by = 0.05)),
+                q = list(quantile(eta, seq(from = 0.05, to = 0.95, by = 0.05)))
+            ) %>%
+            tidyr::unnest(cols = c(p, q)) %>%
+            dplyr::mutate(replicate = i, model = "bottom_up") %>%
+            dplyr::left_join(
+                data.frame(
+                    u = 0:47,
+                    eta = eta_y$eta
+                ),
+                by = "u"
+            )
+
+        return(dplyr::bind_rows(post_qs_no_agg_incl_nat, post_qs_bottom_up))
+    }
+)
+```
+
+```{r, eval = FALSE, include = FALSE}
+# post_qs %>%
+#     dplyr::group_by(p) %>%
+#     dplyr::summarize(
+#         cov = mean(eta <= q),
+#         err = q - eta
+#     )
+```
+
+The following plot shows one-sided quantile coverage rates for the posterior distributions of the $\eta$ parameters at the national level (index $u = 0$) and the sub-national level.  The horizontal axis is a nominal quantile level, and the vertical axis is the proportion of simulation replicates for which that quantile of the posterior was greater than or equal to the true simulated eta.  Calibration is poor for the national level estimates from the **NoAgg** method.  In that setting, the posterior distribution for the national level tends to be too wide.  This is likely due in part to the fact that in this model, the same parameter $\sigma_\eta$ is used to describe variability of the parameter $\eta_u$ around $\theta$ at the national and subnational levels.  This aspect of misspecification could likely be corrected.
+
+```{r, fig.width=8}
+post_qs %>%
+    dplyr::ungroup() %>%
+    dplyr::group_by(model, u, p) %>%
+    dplyr::summarize(
+        cov = mean(eta <= q),
+        err = mean(q - eta)) %>%
+    ggplot() +
+        geom_line(mapping = aes(x = p, y = cov,
+                                group=as.character(u), color=factor(u))) +
+        geom_abline(intercept = 0, slope = 1) +
+        facet_wrap( ~ model) +
+        xlim(0, 1) +
+        ylim(0, 1) +
+        ylab("One sided coverage") +
+        theme_bw()
+```
+
+# Stuff below here is scratch that's not used
+
+```{r}
+bottom_up_stan_code <- "
+data {
+    // Number of observations
+    int<lower=0> T;
+    
+    // Number of sub-national locations
+    int<lower=0> L;
+    
+    // Relative populations in sub-national locations
+    array[L] rel_pop;
+    
+    // Survey-based prevalence estimates
+    matrix[L+1, T]<lower=0, upper=1> y;
+    
+    // Standard errors of survey-based prevalence estimates
+    matrix[L+1, T]<lower=0> s;
+}
+
+parameters {
+    // vector
+    real[L]<lower=0> sigma;
+    
+    // Cholesky factor for correlation matrix capturing
+    // correlation across locations
+    cholesky_factor_corr[K] R_chol;
+    
+    // N(0,1) random deviates for non-centered parameterization for y
+    matrix[L, N] y_raw;
+}
+
+transformed parameters {
+    y = diag(sigma) %*% R_chol %*% y_raw;
+}
+
+model {
+    sigma ~ gamma(2.0, 5.0);
+    R_chol ~ lkj_corr_cholesky(1.0);
+    y_raw ~ normal(0,1);
+}
+"
+
+drop_smallest_stan_code <- "
+data {
+    // Number of observations
+    int<lower=0> T;
+    
+    // Number of sub-national locations
+    int<lower=0> L;
+    
+    // Relative populations in sub-national locations
+    array[L] rel_pop;
+    
+    // Survey-based prevalence estimates
+    matrix[L+1, T]<lower=0, upper=1> y;
+    
+    // Standard errors of survey-based prevalence estimates
+    matrix[L+1, T]<lower=0> s;
+}
+
+parameters {
+    // vector
+    real[L]<lower=0> sigma;
+    
+    // Cholesky factor for correlation matrix capturing
+    // correlation across locations
+    cholesky_factor_corr[K] R_chol;
+    
+    // N(0,1) random deviates for non-centered parameterization for y
+    matrix[L, N] y_raw;
+}
+
+transformed parameters {
+    y = diag(sigma) %*% R_chol %*% y_raw;
+}
+
+model {
+    sigma ~ gamma(2.0, 5.0);
+    R_chol ~ lkj_corr_cholesky(1.0);
+    y_raw ~ normal(0,1);
+}
+"
+```
