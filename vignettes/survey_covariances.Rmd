@@ -1,0 +1,526 @@
+---
+title: "survey_covariances"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{survey_covariances}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 8
+)
+```
+
+```{r setup}
+library(tidyverse)
+library(mvtnorm)
+library(survey)
+library(boot)
+library(dhsfp)
+#library(fpemBenchmark)
+```
+
+# Example with micro data from Kenya
+
+```{r}
+user_email <- "elray@umass.edu"
+```
+
+```{r, eval=FALSE}
+rdhs::set_rdhs_config(
+  email = user_email,
+  project = "FPET Benchmarking",
+  cache_path = here::here("data-user", "rdhs"),
+  config_path = "rdhs.json",
+  global = FALSE
+)
+```
+
+```{r}
+ke_dat <- get_fp_indicators(
+  country_name = "Kenya",
+  year = 2014,
+  save_clean_data = TRUE,
+  by_states = TRUE,
+  output_micro_data_only = TRUE
+)
+
+# fill in missing states by matching on stratum
+# note that this is not a generally reliable strategy since
+# some strata could be mapped to multiple states
+strata_missing_state <- ke_dat |>
+  dplyr::filter(is.na(state)) |>
+  dplyr::pull(stratum) |>
+  unique()
+
+stratum_state_mapping <- ke_dat |>
+  dplyr::filter(
+    !is.na(state),
+    stratum %in% strata_missing_state) |>
+  dplyr::distinct(stratum, state) |>
+  dplyr::group_by(stratum) |>
+  dplyr::slice_min(state)
+
+ke_dat <- ke_dat |>
+  dplyr::left_join(stratum_state_mapping, by = "stratum") |>
+  dplyr::mutate(
+    state = ifelse(!is.na(state.x), state.x, state.y)
+  ) |>
+  dplyr::select(-state.x, -state.y)
+```
+
+```{r}
+design <- svydesign(ids = ~psu,
+                    strata = ~stratum,
+                    weights = ~weight,
+                    data = ke_dat,
+                    nest = TRUE)
+```
+
+National level estimates via mean and ciprop
+
+```{r}
+# estimates and SEs by marital status
+options(survey.lonely.psu = "average")
+
+nat_ests_ciprop <- svyciprop(~modernmethod, design = design)
+nat_ests_ciprop
+
+nat_ests_mean <- svymean(~modernmethod, design = design,
+                         covmat = TRUE, influence = TRUE)
+nat_ests_mean
+
+sub_ests_ciprop <- svyby(~modernmethod, ~state, design = design, svyciprop,
+                         method = "logit")
+as_tibble(sub_ests_ciprop)
+
+sub_ests_mean <- svyby(~modernmethod, ~state, design = design, svymean,
+                       covmat = TRUE, influence = TRUE)
+as_tibble(sub_ests_mean)
+
+ests_combined <- dplyr::bind_rows(
+    as_tibble(nat_ests_mean) |>
+        dplyr::transmute(
+            state = "National",
+            se = modernmethod,
+            modernmethod = mean
+        ),
+    sub_ests_mean
+)
+```
+
+Get an estimate of the full covariance matrix of all national and subnational estimates using influence functions.
+
+```{r}
+combined_infl <- cbind(
+    attr(nat_ests_mean, "influence"),
+    attr(sub_ests_mean, "influence")
+)
+dimnames(combined_infl)[[2]] <- NULL
+
+dim(combined_infl)
+nrow(ke_dat)
+1 + length(unique(ke_dat$state))
+
+covmat <- svyrecvar(combined_infl,
+                    design$cluster, design$strata, design$fpc,
+                    postStrata = design$postStrata)
+
+dim(covmat)
+
+ses <- sqrt(diag(covmat))
+all.equal(ses, ests_combined$se)
+```
+
+```{r}
+covmat2 <- svyrecvar(combined_infl[, c(1, 25)],
+                    design$cluster, design$strata, design$fpc,
+                    postStrata = design$postStrata)
+
+covmat2
+covmat[c(1, 25), c(1, 25)]
+```
+
+We can extract the correlation matrix as follows:
+```{r}
+cormat <- diag(1 / ses) %*% covmat %*% diag(1 / ses)
+
+cormat[1:5, 1:5]
+
+cormat[1, 2:38]
+```
+
+A couple of notes about the correlation matrix:
+
+ - This correlation matrix indicates the presence of correlations between the national level estimate and the estimates in each subnational unit. These are mostly positive, but disconcertingly, one is negative. I can't imagine why this would be; I would think that the correlations would have to all be positive?
+ - There are also occasionally some small correlations between different subnational units. Not sure about this, but perhaps this is because of clusters from the same stratum being mapped to different states?
+
+Below, we extract the non-negative correlations between national and subnational units and get maximum likelihood estimates of a beta distribtuion for those correlations.
+```{r}
+cor_vals <- cormat[1, 2:38]
+cor_vals <- cor_vals[cor_vals >= 0]
+library(EnvStats)
+beta_ests <- EnvStats::ebeta(x = cor_vals)$parameters
+beta_ests
+
+hist(cor_vals, breaks = 10, freq = FALSE)
+p_grid <- seq(from = 0.01, to = 0.6, by = 0.01)
+lines(p_grid, dbeta(p_grid, shape1 = beta_ests[1], shape2 = beta_ests[2]))
+```
+
+# Simulation study
+
+```{r}
+length(unique(ke_dat$stratum))
+```
+
+```{r}
+# up to geographical recoding,
+# strata correspond to the combination of state and residence type
+ke_dat |> distinct(state, residence_type) |> arrange(state)
+
+# two states have only urban residence type
+ke_dat |> distinct(state, residence_type) |> count(state) |> filter(n == 1)
+```
+
+```{r}
+# number of respondents per psu
+ke_dat |> group_by(psu) |> summarize(n = n()) |> pull(n) |> summary()
+```
+
+```{r}
+mm_by_stratum_psu <- ke_dat |>
+    group_by(stratum, psu) |>
+    summarize(mm = mean(modernmethod))
+
+# number of psu's per stratum
+mm_by_stratum_psu |>
+    group_by(stratum) |>
+    summarize(n=n()) |>
+    pull(n) |>
+    summary()
+
+# standard deviation of means for clusters around stratum mean, logit scale
+mm_by_stratum_psu |>
+    group_by(stratum) |>
+    summarize(psu_sd = sd(logit(mm + 0.0001))) |>
+    pull(psu_sd) |>
+    summary()
+
+# standard deviation of means for strata around their mean
+# strata mean calculated by averaging cluster means
+mm_by_stratum_psu |>
+    group_by(stratum) |>
+    summarize(mm = mean(logit(mm + 0.0001))) |>
+    pull(mm) |>
+    sd()
+```
+
+Summary of stylized characteristics of survey for Kenya:
+
+ - 92 strata
+ - Each state has two associated strata (urban and rural), except for two states with only one stratum (urban)
+ - Standard deviations of cluster means within strata vary, but about 1 (logit scale)
+ - Standard deviations of strata means roughly 2 (logit scale)
+ - Overall mean proportion using modern methods is roughly 0.4
+
+```{r}
+# Set up information about strata to use for simulating data with
+# characteristics similar to the real data
+kenya_pop_dat <- readr::read_csv(
+        "../data-raw/Track20 FPET Data/Kenya County Pop DHS Dist.csv",
+        show_col_types = FALSE) |>
+    dplyr::rename(year = mid_year) |>
+    dplyr::filter(is_in_union == "Y", year == 2014) |>
+    dplyr::mutate(
+        state = gsub(" County", "", region_code),
+        state = case_when(
+            state == "Elgeyo Marakwet" ~ "Elgeyo-Marakwet",
+            state == "Muranga" ~ "Murang'a",
+            state == "Tharaka Nithi" ~ "Tharaka-Nithi",
+            TRUE ~ state
+        )
+    )
+
+strata_info <- ke_dat |>
+    dplyr::distinct(state, residence_type) |>
+    dplyr::arrange(state) |>
+    dplyr::left_join(
+        kenya_pop_dat |> dplyr::select(state, population_count),
+        by = "state") |>
+    dplyr::mutate(
+        stratum = dplyr::row_number(),
+        population_count = dplyr::case_when(
+            state %in% c("Mombasa", "Nairobi") ~ population_count,
+            residence_type == "urban" ~ 0.7 * population_count,
+            residence_type == "rural" ~ 0.3 * population_count
+        ),
+        n_psu = floor(population_count / 500)
+    ) |>
+    dplyr::select(stratum, state, residence_type, n_psu)
+
+head(strata_info)
+```
+
+```{r}
+#' @param strata_info data frame containing, at minimum, the columns
+#'     - `stratum` with an integer identifier of the stratum
+#'     - `n_psu`, integer number of psus in each stratum
+#'   It may also have other columns, which will be maintained in the result
+#' @param pop_per_psu
+#' @param mu overall mean across strata, on scale from 0 to 1
+#' @param strata_sd standard deviation of stratum effects on logit scale
+#' @param psu_sd standard deviation of cluster effects on logit scale
+sim_pop_data <- function(strata_info, pop_per_psu = 500, mu = 0.4,
+                         strata_sd = 2, psu_sd = 1) {
+    n_strata <- nrow(strata_info)
+    strata_info$stratum_effect <- rnorm(n = n_strata,
+                                        mean = logit(mu), sd = strata_sd)
+
+    psu_effects <- data.frame(
+        stratum = unlist(lapply(
+            seq_len(n_strata),
+            function(i) {rep(i, strata_info$n_psu[i])})),
+        psu_within_stratum = unlist(lapply(strata_info$n_psu, seq_len))
+    ) |>
+        dplyr::left_join(strata_info, by = "stratum") |>
+        dplyr::mutate(
+            psu_effect = stratum_effect + rnorm(n = dplyr::n(), sd = psu_sd),
+            psu_prop = exp(psu_effect) / (1 + exp(psu_effect))
+        )
+
+    population <- psu_effects |>
+        dplyr::group_by(stratum, psu_within_stratum) |>
+        dplyr::mutate(y = list(rbinom(n = pop_per_psu, size = 1, prob = psu_prop))) |>
+        tidyr::unnest(cols = y)
+
+    return(population)
+}
+```
+
+```{r}
+#' Draw a "two stage simple random sample" from a data frame representing a
+#' population.  Actually not sure this is the right name for the design here.
+#' Within each stratum, select `n_psu_per_stratum` psus, and then within each
+#' selected psu, select `n_ind_per_psu` individuals.
+#'
+#' @param population data frame with columns `stratum`, `psu_within_stratum`,
+#'   `ind_within_psu`, and `y`.
+#' @param n_psu_per_stratum integer number of psus to sample from each stratum
+#' @param n_ind_per_psu integer number of individuals to sample from each psu
+#' 
+#' @return data frame with sampled cases, a subset of the input `population`
+two_stage_srs <- function(population, n_psu_per_stratum, n_ind_per_psu) {
+    population <- population |>
+        dplyr::group_by(stratum) |>
+        dplyr::mutate(psu_sample_prob = n_psu_per_stratum / dplyr::n())
+
+    sampled_psus <- population |>
+        dplyr::distinct(stratum, psu_within_stratum) |>
+        dplyr::group_by(stratum) |>
+        dplyr::slice_sample(n = n_psu_per_stratum)
+
+    sampled_inds <- sampled_psus |>
+        dplyr::left_join(
+            population,
+            by = c("stratum", "psu_within_stratum")
+        ) |>
+        dplyr::group_by(stratum, psu_within_stratum) |>
+        dplyr::slice_sample(n = n_ind_per_psu) |>
+        dplyr::ungroup()
+
+    return(sampled_inds)
+}
+```
+
+```{r, cache = TRUE}
+set.seed(8764211)
+
+# create an artificial population with:
+#  - number of strata matching Kenya survey data
+#  - strata population sizes roughly matching estimates of population size for Kenya
+#  - fixed population size of 500 individuals per PSU
+#  - overall mean proportion and variation across strata and clusters within
+#    strata similar to what we observed in the Kenya survey data
+population <- sim_pop_data(strata_info = strata_info, pop_per_psu = 500,
+                           mu = 0.4, strata_sd = 2, psu_sd = 1)
+
+dim(population)
+head(population)
+
+# The true population mean -- this is what we would like to estimate
+mean(population$y)
+
+#' Function to perform one simulation replicate
+#' 
+#' @param rep_ind integer replicate index
+do_one_sim_rep <- function(rep_ind) {
+    # draw a sample of:
+    #  - 10 clusters within each stratum (with equal probability)
+    #  - 20 individuals within each selected cluster (with equal probability)
+    sample_data <- two_stage_srs(population = population,
+                                n_psu_per_stratum = 10, n_ind_per_psu = 20)
+
+    # not sure I have the design specification right here.
+    # I have calculated prob as
+    # (the number of sampled psu per stratum = 10) / (the number of psu in each stratum in the population)
+    # where the denominator varies by stratum
+    design <- svydesign(ids = ~psu_within_stratum,
+                        probs = ~psu_sample_prob,
+                        strata = ~stratum,
+                        data = sample_data,
+                        nest = TRUE)
+
+    # estimates at national and subnational levels based on sample
+    nat_ests_mean <- svymean(~y, design = design,
+                             covmat = TRUE, influence = TRUE)
+    sub_ests_mean <- svyby(~y, ~state, design = design, svymean,
+                           covmat = TRUE, influence = TRUE)
+
+    ests_combined <- dplyr::bind_rows(
+        as_tibble(nat_ests_mean) |>
+            dplyr::transmute(
+                state = "National",
+                se = y,
+                y = mean
+            ),
+        sub_ests_mean
+    )
+
+    combined_infl <- cbind(
+        attr(nat_ests_mean, "influence"),
+        attr(sub_ests_mean, "influence")
+    )
+    dimnames(combined_infl)[[2]] <- NULL
+
+    covmat <- svyrecvar(combined_infl,
+                        design$cluster, design$strata, design$fpc,
+                        postStrata = design$postStrata)
+
+    return(list(rep_ind = rep_ind,
+                ests_combined = ests_combined,
+                covmat = covmat))
+}
+
+sim_results <- lapply(1:1000, do_one_sim_rep)
+```
+
+```{r, fig.height = 12}
+# check how good the point estimates were --
+# may indicate whether I set things up correctly
+# looks pretty reasonable...
+all_ests <- dplyr::bind_rows(
+    lapply(
+        sim_results,
+        function(res_i) {
+            res_i$ests_combined |>
+                dplyr::mutate(rep_ind = res_i$rep_ind)
+        }))
+
+ggplot(data = all_ests) +
+    geom_histogram(mapping = aes(x = y)) +
+    geom_vline(
+        data = population |>
+            dplyr::group_by(state) |>
+            dplyr::summarize(y = mean(y)),
+        mapping = aes(xintercept = y)
+    ) +
+    facet_wrap( ~ state)
+
+
+# check how good the standard errors were in comparison to
+# empirical variation in estimates across samples
+# pretty good overall, though there is a miss in Lamu
+ggplot(data = all_ests) +
+    geom_histogram(mapping = aes(x = se)) +
+    geom_vline(
+        data = all_ests |>
+            dplyr::group_by(state) |>
+            dplyr::summarize(empirical_se = sd(y)),
+        mapping = aes(xintercept = empirical_se)
+    ) +
+    facet_wrap( ~ state)
+
+all_ests %>%
+    select(state, y, rep_ind) %>%
+    pivot_wider(names_from = "state", values_from = "y") %>%
+    select(-rep_ind) %>%
+    as.matrix() %>%
+    var() %>%
+    diag() %>%
+    sqrt()
+
+# compute the empirical covariance of the estimates from subnational and national units
+all_ests_mat <- do.call(
+    rbind,
+    lapply(
+        sim_results,
+        function(res_i) {
+            res_i$ests_combined$y
+        }))
+
+empirical_cov <- var(all_ests_mat)
+
+# double checking that I have done cov calculation right
+empirical_ses <- sqrt(diag(empirical_cov))
+ses_via_dplyr <- all_ests |>
+    dplyr::group_by(state) |>
+    dplyr::summarize(empirical_se = sd(y))
+
+all.equal(
+    empirical_ses,
+    c(
+        ses_via_dplyr |> dplyr::filter(state == "National") |> dplyr::pull(empirical_se),
+        ses_via_dplyr |> dplyr::filter(state != "National") |> dplyr::pull(empirical_se)
+    )
+)
+
+# investigate empirical covariance estimates
+# lots of non-zero covariances; maybe number of simulation replicates is
+# too small to get at covariances accurately?
+empirical_cov[1:5, 1:5]
+
+all_nat_subnat_cov_ests <- dplyr::bind_rows(
+    lapply(
+        sim_results,
+        function(res_i) {
+            data.frame(
+                state = res_i$ests_combined$state[2:48],
+                nat_subnat_cov = res_i$covmat[1, 2:48]
+            )
+        }))
+
+# however, covariance estimates between national and subnational units
+# match empirical covariances fairly well
+ggplot(data = all_nat_subnat_cov_ests) +
+    geom_histogram(mapping = aes(x = nat_subnat_cov)) +
+    geom_vline(
+        data = data.frame(
+            state = sim_results[[1]]$ests_combined$state[2:48],
+            nat_subnat_cov = empirical_cov[1, 2:48]),
+        mapping = aes(xintercept = nat_subnat_cov)
+    ) +
+    facet_wrap( ~ state)
+
+# note that in this simulation, there are no negative covariance estimates
+# between national and subnational units
+sum(all_nat_subnat_cov_ests$nat_subnat_cov < 0)
+
+# all subnational covariance estimates are 0
+all_subnat_cov_ests <- unlist(lapply(
+    sim_results,
+    function(res_i) {
+        subnat_cov <- res_i$covmat[2:48, 2:48]
+        subnat_cov[lower.tri(subnat_cov)]
+    }
+))
+all(all_subnat_cov_ests == 0)
+
+# empirical estimates not exactly 0, but centered around 0
+subnat_empirical_cov <- empirical_cov[2:48, 2:48]
+hist(subnat_empirical_cov[lower.tri(subnat_empirical_cov)])
+```
